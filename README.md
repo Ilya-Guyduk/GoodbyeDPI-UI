@@ -1,6 +1,4 @@
-Отличная идея! Вот подробный README для проекта:
 
-```markdown
 # GoodbyeDPI GUI
 
 Современная графическая обёртка для [GoodbyeDPI](https://github.com/ValdikSS/GoodbyeDPI) — утилиты для обхода Deep Packet Inspection (DPI) и разблокировки сайтов.
