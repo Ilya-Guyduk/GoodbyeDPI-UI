@@ -61,6 +61,8 @@ def restart_as_admin():
 
 # ── Downloader ────────────────────────────────────────────────────────────────
 
+import queue
+
 class DownloadDialog(tk.Toplevel):
     """Диалог загрузки GoodbyeDPI"""
     def __init__(self, parent):
@@ -76,8 +78,20 @@ class DownloadDialog(tk.Toplevel):
         self.focus_set()
         
         self._result = None
+        self._download_complete = False
+        self._error_message = None
+        
+        # Очередь для передачи обновлений из фонового потока
+        self._update_queue = queue.Queue()
+        
         self._ui()
-        self._start_download()
+        
+        # Запускаем загрузку в отдельном потоке
+        self._download_thread = threading.Thread(target=self._download_thread_func, daemon=True)
+        self._download_thread.start()
+        
+        # Запускаем обработку очереди
+        self._process_queue()
         
     def _ui(self):
         # Заголовок
@@ -86,7 +100,7 @@ class DownloadDialog(tk.Toplevel):
         title.pack(pady=(30, 10))
         
         # Статус
-        self.status_label = tk.Label(self, text="Получение информации о последней версии...",
+        self.status_label = tk.Label(self, text="Подготовка к загрузке...",
                                     bg=SURFACE, fg=TEXT2, font=("Segoe UI", 10))
         self.status_label.pack(pady=(10, 20))
         
@@ -110,9 +124,62 @@ class DownloadDialog(tk.Toplevel):
         self.manual_btn = Btn(btn_frame, "Выбрать вручную", self._manual,
                              bg=SURFACE2, fg=TEXT2, px=12, py=5)
         self.manual_btn.pack(side="left", padx=5)
+    
+    def _process_queue(self):
+        """Обрабатывает сообщения из очереди в главном потоке"""
+        try:
+            while True:
+                msg = self._update_queue.get_nowait()
+                if msg['type'] == 'status':
+                    self.status_label.config(text=msg['text'])
+                elif msg['type'] == 'progress':
+                    self.progress.config(value=msg['value'])
+                elif msg['type'] == 'detail':
+                    self.detail_label.config(text=msg['text'])
+                elif msg['type'] == 'error':
+                    self._error_message = msg['text']
+                elif msg['type'] == 'complete':
+                    self._result = msg['result']
+                    self._download_complete = True
+        except queue.Empty:
+            pass
         
+        if self._error_message:
+            messagebox.showerror("Ошибка загрузки", self._error_message)
+            self._error_message = None
+        
+        if self._download_complete:
+            if self._result:
+                self.after(1500, self.destroy)
+            else:
+                self.after(100, self.destroy)
+        else:
+            # Продолжаем обработку очереди
+            self.after(100, self._process_queue)
+    
+    def _queue_status(self, text):
+        """Добавляет обновление статуса в очередь"""
+        self._update_queue.put({'type': 'status', 'text': text})
+    
+    def _queue_progress(self, value):
+        """Добавляет обновление прогресса в очередь"""
+        self._update_queue.put({'type': 'progress', 'value': value})
+    
+    def _queue_detail(self, text):
+        """Добавляет обновление деталей в очередь"""
+        self._update_queue.put({'type': 'detail', 'text': text})
+    
+    def _queue_error(self, text):
+        """Добавляет сообщение об ошибке в очередь"""
+        self._update_queue.put({'type': 'error', 'text': text})
+    
+    def _queue_complete(self, result):
+        """Отмечает завершение загрузки"""
+        self._update_queue.put({'type': 'complete', 'result': result})
+    
     def _cancel(self):
         self._result = None
+        self._download_complete = True
         self.destroy()
         
     def _manual(self):
@@ -122,107 +189,177 @@ class DownloadDialog(tk.Toplevel):
         )
         if path:
             self._result = path
+            self._download_complete = True
             self.destroy()
     
-    def _start_download(self):
-        def download_thread():
-            try:
-                # Получаем информацию о последнем релизе
-                self._update_status("Получение информации о релизе...", 10)
-                
-                req = urllib.request.Request(GDPI_RELEASES_URL)
-                req.add_header('User-Agent', 'Mozilla/5.0')
-                
-                with urllib.request.urlopen(req, timeout=10) as response:
-                    data = json.loads(response.read().decode())
-                
-                # Ищем assets для Windows
-                assets = data.get('assets', [])
-                download_url = None
-                version = data.get('tag_name', 'latest')
-                
+    def _download_thread_func(self):
+        """Фоновая загрузка GoodbyeDPI и WinDivert.dll"""
+        try:
+            # Получаем информацию о последнем релизе
+            self._queue_status("Получение информации о релизе...")
+            self._queue_progress(5)
+            self._queue_detail("5%")
+            
+            req = urllib.request.Request(GDPI_RELEASES_URL)
+            req.add_header('User-Agent', 'Mozilla/5.0')
+            
+            with urllib.request.urlopen(req, timeout=10) as response:
+                data = json.loads(response.read().decode())
+            
+            # Ищем assets для Windows
+            assets = data.get('assets', [])
+            download_url = None
+            version = data.get('tag_name', 'latest')
+            
+            for asset in assets:
+                name = asset.get('name', '').lower()
+                if name.endswith('.zip') and ('x86_64' in name or 'win64' in name or 'windows' in name):
+                    download_url = asset.get('browser_download_url')
+                    break
+            
+            if not download_url:
+                # Если не нашли конкретную версию, пробуем любой zip
                 for asset in assets:
-                    name = asset.get('name', '').lower()
-                    if name.endswith('.zip') and ('x86_64' in name or 'win64' in name or 'windows' in name):
+                    if asset.get('name', '').lower().endswith('.zip'):
                         download_url = asset.get('browser_download_url')
                         break
-                
-                if not download_url:
-                    # Если не нашли конкретную версию, пробуем любой zip
-                    for asset in assets:
-                        if asset.get('name', '').lower().endswith('.zip'):
-                            download_url = asset.get('browser_download_url')
-                            break
-                
-                if not download_url:
-                    raise Exception("Не удалось найти файл для загрузки")
-                
-                # Загружаем файл
-                self._update_status(f"Загрузка GoodbyeDPI {version}...", 20)
-                
-                # Создаем временную директорию
-                with tempfile.TemporaryDirectory() as temp_dir:
-                    zip_path = os.path.join(temp_dir, "goodbyedpi.zip")
-                    
-                    # Загружаем с прогрессом
-                    def report_progress(block_num, block_size, total_size):
-                        if total_size > 0:
-                            downloaded = block_num * block_size
-                            percent = min(20 + int(downloaded * 70 / total_size), 90)
-                            self._update_status(
-                                f"Загрузка: {downloaded // 1024} KB / {total_size // 1024} KB",
-                                percent
-                            )
-                            self.update()
-                    
-                    urllib.request.urlretrieve(download_url, zip_path, reporthook=report_progress)
-                    
-                    # Распаковываем
-                    self._update_status("Распаковка архива...", 90)
-                    self.update()
-                    
-                    extract_dir = os.path.join(temp_dir, "extracted")
-                    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                        zip_ref.extractall(extract_dir)
-                    
-                    # Ищем goodbyedpi.exe
-                    exe_path = None
-                    for root, dirs, files in os.walk(extract_dir):
-                        for file in files:
-                            if file.lower() == "goodbyedpi.exe":
-                                exe_path = os.path.join(root, file)
-                                break
-                        if exe_path:
-                            break
-                    
-                    if not exe_path:
-                        raise Exception("goodbyedpi.exe не найден в архиве")
-                    
-                    # Копируем в текущую директорию
-                    target_path = os.path.join(os.getcwd(), "goodbyedpi.exe")
-                    shutil.copy2(exe_path, target_path)
-                    
-                    self._update_status("Загрузка завершена!", 100)
-                    self._result = target_path
-                    
-            except Exception as e:
-                self._update_status(f"Ошибка: {str(e)}", 0)
-                messagebox.showerror("Ошибка загрузки", 
-                    f"Не удалось загрузить GoodbyeDPI:\n{str(e)}\n\n"
-                    "Вы можете скачать его вручную с:\n"
-                    "https://github.com/ValdikSS/GoodbyeDPI/releases")
             
-            finally:
-                self.after(1000, self.destroy)
-        
-        threading.Thread(target=download_thread, daemon=True).start()
-    
-    def _update_status(self, text, percent):
-        self.after(0, lambda: self.status_label.config(text=text))
-        self.after(0, lambda: self.progress.config(value=percent))
-        self.after(0, lambda: self.detail_label.config(
-            text=f"{percent}%" if percent < 100 else "Готово"))
+            if not download_url:
+                raise Exception("Не удалось найти файл для загрузки")
+            
+            # Загружаем файл
+            self._queue_status(f"Загрузка GoodbyeDPI {version}...")
+            self._queue_progress(10)
+            self._queue_detail("10%")
+            
+            # Создаем временную директорию
+            with tempfile.TemporaryDirectory() as temp_dir:
+                zip_path = os.path.join(temp_dir, "goodbyedpi.zip")
+                
+                # Загружаем с прогрессом
+                def report_progress(block_num, block_size, total_size):
+                    if total_size > 0:
+                        downloaded = block_num * block_size
+                        percent = min(10 + int(downloaded * 60 / total_size), 70)
+                        self._queue_status(f"Загрузка архива: {downloaded // 1024} KB / {total_size // 1024} KB")
+                        self._queue_progress(percent)
+                        self._queue_detail(f"{percent}%")
+                
+                urllib.request.urlretrieve(download_url, zip_path, reporthook=report_progress)
+                
+                # Распаковываем
+                self._queue_status("Распаковка архива...")
+                self._queue_progress(75)
+                self._queue_detail("75%")
+                
+                extract_dir = os.path.join(temp_dir, "extracted")
+                with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                    zip_ref.extractall(extract_dir)
+                
+                # Ищем goodbyedpi.exe
+                exe_path = None
+                for root, dirs, files in os.walk(extract_dir):
+                    for file in files:
+                        if file.lower() == "goodbyedpi.exe":
+                            exe_path = os.path.join(root, file)
+                            break
+                    if exe_path:
+                        break
+                
+                if not exe_path:
+                    raise Exception("goodbyedpi.exe не найден в архиве")
+                
+                # Проверяем наличие WinDivert.dll в архиве
+                self._queue_status("Проверка WinDivert.dll...")
+                self._queue_progress(80)
+                self._queue_detail("80%")
+                
+                windivert_path = None
+                windivert_versions = ['WinDivert.dll', 'WinDivert64.dll', 'WinDivert32.dll']
+                
+                for root, dirs, files in os.walk(extract_dir):
+                    for file in files:
+                        if file in windivert_versions:
+                            windivert_path = os.path.join(root, file)
+                            break
+                    if windivert_path:
+                        break
+                
+                # Копируем goodbyedpi.exe в текущую директорию
+                target_path = os.path.join(os.getcwd(), "goodbyedpi.exe")
+                shutil.copy2(exe_path, target_path)
+                self._queue_status("GoodbyeDPI.exe установлен")
+                self._queue_progress(90)
+                self._queue_detail("90%")
+                
+                # Копируем WinDivert.dll если нашли
+                if windivert_path:
+                    windivert_target = os.path.join(os.getcwd(), "WinDivert.dll")
+                    shutil.copy2(windivert_path, windivert_target)
+                    self._queue_status("WinDivert.dll установлен")
+                else:
+                    # Если WinDivert.dll нет в архиве, пробуем скачать отдельно
+                    self._queue_status("Загрузка WinDivert.dll...")
+                    self._queue_progress(92)
+                    self._queue_detail("92%")
+                    
+                    if self._download_windivert():
+                        self._queue_status("WinDivert.dll установлен")
+                    else:
+                        self._queue_status("WinDivert.dll не найден, но может работать без него")
+                
+                self._queue_progress(100)
+                self._queue_detail("Готово")
+                
+                # Показываем сообщение об успешной установке
+                message = "GoodbyeDPI успешно установлен!"
+                if windivert_path or os.path.exists(os.path.join(os.getcwd(), "WinDivert.dll")):
+                    message += "\n\nWinDivert.dll также установлен."
+                else:
+                    message += "\n\nWinDivert.dll не найден. Возможно, потребуется установить его вручную:\nhttps://github.com/ValdikSS/GoodbyeDPI/releases"
+                
+                self._queue_status("Установка завершена!")
+                self._queue_complete(target_path)
+                
+                # Показываем информационное сообщение в главном потоке
+                def show_success():
+                    messagebox.showinfo("Установка завершена", message)
+                self.after(100, show_success)
+                
+        except Exception as e:
+            error_msg = f"Не удалось загрузить GoodbyeDPI:\n{str(e)}\n\nВы можете скачать его вручную с:\nhttps://github.com/ValdikSS/GoodbyeDPI/releases"
+            self._queue_status(f"Ошибка: {str(e)}")
+            self._queue_progress(0)
+            self._queue_detail("Ошибка")
+            self._queue_error(error_msg)
+            self._queue_complete(None)
 
+    def _download_windivert(self):
+        """Пытается скачать WinDivert.dll отдельно"""
+        try:
+            # URL для WinDivert.dll (можно обновить при необходимости)
+            windivert_urls = [
+                "https://github.com/ValdikSS/GoodbyeDPI/releases/download/0.2.3rc3/WinDivert.dll",
+                "https://github.com/ValdikSS/GoodbyeDPI/releases/download/0.2.2/WinDivert.dll",
+            ]
+            
+            for url in windivert_urls:
+                try:
+                    req = urllib.request.Request(url)
+                    req.add_header('User-Agent', 'Mozilla/5.0')
+                    
+                    with tempfile.NamedTemporaryFile(delete=False, suffix='.dll') as tmp:
+                        urllib.request.urlretrieve(url, tmp.name)
+                        target_path = os.path.join(os.getcwd(), "WinDivert.dll")
+                        shutil.copy2(tmp.name, target_path)
+                        os.unlink(tmp.name)
+                        return True
+                except:
+                    continue
+            
+            return False
+        except:
+            return False
 
 def check_and_download_gdpi(parent):
     """Проверяет наличие goodbyedpi.exe и предлагает скачать"""
